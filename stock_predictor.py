@@ -2,40 +2,35 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-
-# Machine learning and forecasting libraries
-from sklearn.linear_model import Lasso
-from scipy.signal import savgol_filter
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from sktime.forecasting.naive import NaiveForecaster
-from sklearn.tree import DecisionTreeRegressor
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, SimpleRNN
-
+from scipy.optimize import curve_fit
+from scipy.signal import find_peaks
 
 class StockPredictor:
     def __init__(self, data_folder="Bundle2"):
-        """
-        Initializes the predictor and loads asset data from the given folder.
-        The expected file names must end with "Part2.txt".
-        """
         self.data_folder = data_folder
         self.asset_names, self.asset_times, self.asset_prices = self.load_data()
 
     def load_data(self):
-        """
-        Loads asset data from text files in self.data_folder.
-        Each file should have:
-          - A first line with the asset name.
-          - A second line with the number of data points.
-          - Then each line contains a time and price.
-        Returns lists of asset names, times, and prices.
-        """
         asset_names = []
         asset_times = []
         asset_prices = []
-        txt_files = [f for f in os.listdir(self.data_folder) if f.endswith("Part2.txt")]
+        
+        folder_name = os.path.basename(self.data_folder).lower()
+        if "bundle" in folder_name and folder_name[-1].isdigit():
+            part_suffix = f"Part{folder_name[-1]}.txt"
+        else:
+            part_suffix = ".txt"
+            
+        print(f"Looking for files with suffix: {part_suffix}")
+        
+        txt_files = [f for f in os.listdir(self.data_folder) if f.endswith(part_suffix)]
+        
+        if not txt_files:
+            print(f"No files found with suffix {part_suffix}, looking for any .txt files")
+            txt_files = [f for f in os.listdir(self.data_folder) if f.endswith('.txt')]
+            
+        print(f"Found {len(txt_files)} files to process")
+        
         for fname in txt_files:
             path = os.path.join(self.data_folder, fname)
             with open(path, "r") as f:
@@ -51,69 +46,469 @@ class StockPredictor:
             asset_names.append(asset_name)
             asset_times.append(times)
             asset_prices.append(prices)
+            
+        if not asset_names:
+            raise ValueError(f"No asset data found in folder: {self.data_folder}")
+            
         return asset_names, asset_times, asset_prices
 
-    def plot_forecasts(self, forecast_results):
-        """
-        Plots the forecast results for up to 20 assets in a 5x4 grid.
-        Historical prices are shown as black scatter points.
-        For each asset:
-          - A marker is plotted at the training end time.
-          - A forecast marker is plotted at the forecast time.
-          - If available, the full reconstruction is plotted as a line.
-        """
-        fig, axes = plt.subplots(5, 4, figsize=(20, 25))
-        axes = axes.flatten()
-        num_assets = min(len(self.asset_names), 20)
+    def analyze_market_cycles(self, times, prices, min_peak_height=0.05, min_peak_distance=10):
+        price_range = np.max(prices) - np.min(prices)
+        if price_range == 0:
+            return {"trend": "flat", "avg_cycle_length": None, "volatility": 0}
+            
+        prices_norm = (prices - np.min(prices)) / price_range
+        
+        peak_indices, _ = find_peaks(prices_norm, height=min_peak_height, distance=min_peak_distance)
+        trough_indices, _ = find_peaks(-prices_norm, height=min_peak_height, distance=min_peak_distance)
+        
+        if len(peak_indices) < 2 and len(trough_indices) < 2:
+            if len(times) > 1:
+                coef = np.polyfit(times, prices, 1)[0]
+                trend = "upward" if coef > 0 else "downward" if coef < 0 else "flat"
+            else:
+                trend = "flat"
+                
+            if len(prices) > 1:
+                volatility = np.std(prices) / np.mean(prices) if np.mean(prices) != 0 else 0
+            else:
+                volatility = 0
+                
+            return {"trend": trend, "avg_cycle_length": None, "volatility": volatility}
+        
+        cycle_lengths = []
+        if len(peak_indices) >= 2:
+            for i in range(1, len(peak_indices)):
+                cycle_lengths.append(times[peak_indices[i]] - times[peak_indices[i-1]])
+        
+        elif len(trough_indices) >= 2:
+            for i in range(1, len(trough_indices)):
+                cycle_lengths.append(times[trough_indices[i]] - times[trough_indices[i-1]])
+        
+        avg_cycle_length = np.mean(cycle_lengths) if cycle_lengths else None
+        
+        if len(times) > 1:
+            coef = np.polyfit(times, prices, 1)[0]
+            trend = "upward" if coef > 0 else "downward" if coef < 0 else "flat"
+        else:
+            trend = "flat"
+            
+        volatility = np.std(prices) / np.mean(prices) if np.mean(prices) != 0 else 0
+        
+        last_idx = len(prices) - 1
+        
+        if peak_indices.size > 0 and trough_indices.size > 0:
+            last_peak_idx = peak_indices[-1]
+            last_trough_idx = trough_indices[-1]
+            
+            if last_peak_idx > last_trough_idx:
+                cycle_position = "near_peak"
+            else:
+                cycle_position = "near_trough"
+                
+            if last_idx - max(last_peak_idx, last_trough_idx) > min_peak_distance:
+                if prices[-1] > prices[last_peak_idx] * 0.95:
+                    cycle_position = "near_peak"
+                elif prices[-1] < prices[last_trough_idx] * 1.05:
+                    cycle_position = "near_trough"
+                else:
+                    recent_trend = "upward" if prices[-1] > prices[-min(10, len(prices))] else "downward"
+                    cycle_position = "mid_upward" if recent_trend == "upward" else "mid_downward"
+        else:
+            cycle_position = "near_peak" if trend == "upward" else "near_trough"
+        
+        return {
+            "trend": trend,
+            "avg_cycle_length": avg_cycle_length,
+            "volatility": volatility,
+            "cycle_position": cycle_position,
+            "peak_indices": peak_indices,
+            "trough_indices": trough_indices
+        }
 
-        for i in range(num_assets):
-            ax = axes[i]
-            asset = self.asset_names[i]
+    def market_aware_curve_fit_forecast(self, max_attempts=7, reversion_strength=0.6):
+        import warnings
+        
+        # def model_linear(x, a, b):
+        #     return a * x + b
+        
+        # def model_quadratic(x, a, b, c):
+        #     return a * x**2 + b * x + c
+        
+        # def model_sin_linear(x, a, b, c, d, e):
+        #     return a * np.sin(b * x + c) + d * x + e
+        
+        # def model_exp(x, a, b, c):
+        #     safe_exp = np.exp(np.minimum(b * x, 700))
+        #     return a * safe_exp + c
+        
+        # def model_log(x, a, b, c):
+        #     with np.errstate(divide='ignore', invalid='ignore'):
+        #         result = a * np.log(np.maximum(b * x, 1e-10)) + c
+        #         invalid_mask = ~np.isfinite(result)
+        #         if np.any(invalid_mask):
+        #             valid_mask = ~invalid_mask
+        #             if np.sum(valid_mask) >= 2:
+        #                 coeffs = np.polyfit(x[valid_mask], result[valid_mask], 1)
+        #                 result[invalid_mask] = np.polyval(coeffs, x[invalid_mask])
+        #             else:
+        #                 result[invalid_mask] = result[~invalid_mask][0] if np.any(~invalid_mask) else 0
+        #         return result
+        
+        # def model_logistic(x, a, b, c, d):
+        #     return a / (1 + b * np.exp(-c * x)) + d
+        
+        def model_damped_sin(x, a, b, c, d, e, f):
+            return a * np.exp(-b * x) * np.sin(c * x + d) + e * x + f
+        
+        # def model_power(x, a, b, c):
+        #     with np.errstate(divide='ignore', invalid='ignore'):
+        #         result = a * np.power(np.maximum(x, 1e-10), b) + c
+        #         invalid_mask = ~np.isfinite(result)
+        #         if np.any(invalid_mask):
+        #             valid_mask = ~invalid_mask
+        #             if np.sum(valid_mask) >= 2:
+        #                 coeffs = np.polyfit(x[valid_mask], result[valid_mask], 1)
+        #                 result[invalid_mask] = np.polyval(coeffs, x[invalid_mask])
+        #             else:
+        #                 result[invalid_mask] = 0
+        #         return result
+        
+        def model_holt_winters(x, level, trend, season1, season2, period=50):
+            result = np.zeros_like(x, dtype=float)
+            for i, t in enumerate(x):
+                cycle = np.sin(2 * np.pi * t / period)
+                result[i] = level + trend * t + season1 * cycle + season2 * np.cos(2 * np.pi * t / period)
+            return result
+        
+        # def model_fourier(x, a0, a1, b1, a2, b2, w):
+        #     return a0 + a1 * np.cos(w * x) + b1 * np.sin(w * x) + a2 * np.cos(2 * w * x) + b2 * np.sin(2 * w * x)
+        
+        models = [
+            # (model_linear, "Linear"),
+            # (model_quadratic, "Quadratic"),
+            # (model_sin_linear, "Sin+Linear"),
+            # (model_log, "Logarithmic"),
+            # (model_logistic, "Logistic"),
+            # (model_power, "Power"),
+            # (model_fourier, "Fourier"),
+            (model_holt_winters, "HoltWinters"),
+            (model_damped_sin, "DampedSin"),
+            # (model_exp, "Exponential")
+        ]
+        
+        curve_fit_pred = {}
+        
+        for i, name in enumerate(self.asset_names):
+            print(f"Processing asset: {name}")
             times = np.array(self.asset_times[i])
             prices = np.array(self.asset_prices[i])
-            ax.scatter(times, prices, label="Historical Prices", color="black")
+            training_start = times[0]
+            training_end = times[-1]
+            forecast_time = training_end + 100
+            
+            market_info = self.analyze_market_cycles(times, prices)
+            print(f"  Market trend: {market_info['trend']}, Position: {market_info.get('cycle_position', 'unknown')}")
+            print(f"  Volatility: {market_info['volatility']:.4f}")
+            
+            if market_info['avg_cycle_length']:
+                print(f"  Average cycle length: {market_info['avg_cycle_length']:.2f}")
+            
+            mask = (times >= training_start) & (times <= training_end)
+            t_train = times[mask]
+            p_train = prices[mask]
+            
+            price_mean = np.mean(p_train)
+            price_min = np.min(p_train)
+            price_max = np.max(p_train)
+            price_last = p_train[-1]
+            
+            best_model = None
+            best_model_name = None
+            best_params = None
+            best_mse = float('inf')
+            best_predictions = None
+            
+            models_to_try = models[:min(max_attempts, len(models))]
+            
+            for model_func, model_name in models_to_try:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        
+                        if model_name == "Exponential" and (price_max / max(price_min, 0.001) > 100):
+                            print(f"  Skipping {model_name} due to large price range")
+                            continue
+                        
+                        p0 = np.ones(model_func.__code__.co_argcount - 1)
+                        
+                        if model_name == "Quadratic":
+                            if len(t_train) > 2:
+                                trend_coef = np.polyfit(t_train, p_train, 1)[0]
+                                p0[0] = -0.0001 if trend_coef < 0 else 0.0001
+                        elif model_name == "HoltWinters":
+                            p0[0] = price_mean  # level
+                            p0[1] = 0  # trend
+                            p0[2] = 0.1  # season1
+                            p0[3] = 0.1  # season2
+                        elif model_name == "Fourier":
+                            if market_info['avg_cycle_length']:
+                                p0[5] = 2 * np.pi / market_info['avg_cycle_length']  # omega
+                            else:
+                                p0[5] = 0.1
+                        
+                        bounds = ([-1000] * len(p0), [1000] * len(p0))
+                        
+                        if model_name == "Sin+Linear":
+                            bounds[0][1] = 0.001
+                            bounds[1][1] = 10
+                        elif model_name == "DampedSin":
+                            bounds[0][1] = 0.0001
+                            bounds[1][1] = 0.1
+                            bounds[0][2] = 0.001
+                            bounds[1][2] = 10
+                            p0[1] = 0.01
+                            p0[2] = 0.1
+                        elif model_name == "Logistic":
+                            mid_x = np.mean(t_train)
+                            p0[0] = price_max - price_min
+                            p0[1] = 1.0
+                            p0[2] = 0.1
+                            p0[3] = price_min
+                            bounds[0][2] = 0.001
+                            bounds[1][2] = 1.0
+                        elif model_name == "Exponential":
+                            p0[1] = 0.001
+                            bounds[0][1] = -0.1
+                            bounds[1][1] = 0.1
+                        elif model_name == "Fourier":
+                            bounds[0][5] = 0.001  # min frequency
+                            bounds[1][5] = 10.0  # max frequency
+                        
+                        params, _ = curve_fit(
+                            model_func, t_train, p_train,
+                            p0=p0,
+                            bounds=bounds,
+                            maxfev=20000,
+                            method='trf'
+                        )
+                        
+                        predictions = model_func(t_train, *params)
+                        mse = np.mean((predictions - p_train)**2)
+                        
+                        if mse < best_mse:
+                            best_mse = mse
+                            best_model = model_func
+                            best_model_name = model_name
+                            best_params = params
+                            best_predictions = predictions
+                    
+                    print(f"  Tried {model_name}: MSE = {mse:.4f}")
+                    
+                except Exception as e:
+                    print(f"  {model_name} fitting failed: {str(e)}")
+                    continue
+            
+            if best_model is None:
+                print("  All models failed, falling back to linear regression")
+                coeffs = np.polyfit(t_train, p_train, 1)
+                best_predictions = np.polyval(coeffs, t_train)
+                best_model_name = "Linear fallback"
+                
+                def linear_fallback(x):
+                    return np.polyval(coeffs, x)
+                
+                forecast_times = np.linspace(training_end + 1, forecast_time, int(forecast_time - training_end))
+                raw_forecast_values = linear_fallback(forecast_times)
+            else:
+                print(f"  Selected {best_model_name} model with MSE: {best_mse:.4f}")
+                
+                forecast_times = np.linspace(training_end + 1, forecast_time, int(forecast_time - training_end))
+                raw_forecast_values = best_model(forecast_times, *best_params)
+            
+            adjusted_forecast_values = raw_forecast_values.copy()
+            
+            forecast_max = np.max(raw_forecast_values)
+            forecast_min = np.min(raw_forecast_values)
+            
+            if len(raw_forecast_values) >= 2:
+                forecast_direction = "upward" if raw_forecast_values[-1] > raw_forecast_values[0] else "downward"
+            else:
+                forecast_direction = "flat"
+            
+            price_range = price_max - price_min
+            extreme_threshold = 1.5
+            
+            extreme_high = forecast_max > price_max + extreme_threshold * price_range
+            extreme_low = forecast_min < price_min - extreme_threshold * price_range
+            
+            cycle_position = market_info.get('cycle_position', 'unknown')
+            
+            if extreme_high or extreme_low or (cycle_position in ['near_peak', 'near_trough']):
+                print(f"  Applying market-aware mean reversion (strength={reversion_strength:.2f})")
+                
+                if cycle_position == 'near_peak' and forecast_direction == 'upward':
+                    print("  Near market peak with upward forecast - increasing reversion")
+                    effective_reversion = min(reversion_strength * 1.5, 0.9)
+                    reversion_target = max(price_mean, price_min + price_range * 0.4)
+                    
+                elif cycle_position == 'near_trough' and forecast_direction == 'downward':
+                    print("  Near market trough with downward forecast - increasing reversion")
+                    effective_reversion = min(reversion_strength * 1.5, 0.9)
+                    reversion_target = min(price_mean, price_max - price_range * 0.4)
+                    
+                else:
+                    effective_reversion = reversion_strength
+                    reversion_target = price_mean
+                
+                for j in range(len(adjusted_forecast_values)):
+                    t_factor = j / len(adjusted_forecast_values)
+                    local_reversion = effective_reversion * t_factor
+                    adjusted_forecast_values[j] = (1 - local_reversion) * raw_forecast_values[j] + local_reversion * reversion_target
+            
+            adjusted_forecast_values = np.maximum(adjusted_forecast_values, 0)
+            
+            actual_last_price = p_train[-1]
+            model_price_at_training = best_predictions[-1] if best_predictions is not None else p_train[-1]
+            price_at_forecast = adjusted_forecast_values[-1]
+            predicted_return = ((price_at_forecast / actual_last_price) - 1) * 100
+            
+            full_times = np.concatenate([t_train, forecast_times])
+            full_predictions = np.concatenate([best_predictions, adjusted_forecast_values])
+            
+            full_predictions = np.maximum(full_predictions, 0)
+            
+            curve_fit_pred[name] = {
+                "model_predictions": (t_train, best_predictions),
+                "full_reconstruction": (full_times, full_predictions),
+                "raw_forecast": (forecast_times, raw_forecast_values),
+                "price_at_training": model_price_at_training,
+                "actual_last_price": actual_last_price,
+                "price_at_forecast": price_at_forecast,
+                "predicted_return": predicted_return,
+                "training_end": training_end,
+                "forecast_time": forecast_time,
+                "model_name": best_model_name,
+                "market_info": market_info
+            }
+        
+        return curve_fit_pred
 
-            # Retrieve the forecast dictionary for this asset.
-            forecast = forecast_results[asset]
-            training_end = forecast.get("training_end")
-            forecast_time = forecast.get("forecast_time")
-            # Plot training marker at training_end.
-            ax.scatter([training_end], [forecast["price_at_training"]],
-                       marker="o", color="red", s=200,
-                       label=f"Training End @ t={training_end}")
-            # Plot forecast marker at forecast_time.
-            ax.scatter([forecast_time], [forecast["price_at_forecast"]],
-                       marker="x", color="red", s=200,
-                       label=f"Forecast @ t={forecast_time}")
-
-            if "full_reconstruction" in forecast:
-                recon_times, reconstruction = forecast["full_reconstruction"]
-                ax.plot(recon_times, reconstruction, label="Reconstruction",
-                        color="red", linewidth=2)
-            ax.set_title(asset)
+    def plot_market_aware_predictions(self, training_start=0, training_end=None, forecast_time=None, show_raw=True):
+        if training_end is None:
+            training_end = self.asset_times[0][-1]
+            
+        if forecast_time is None:
+            forecast_time = training_end + 100
+            
+        curve_fit_results = self.market_aware_curve_fit_forecast(max_attempts=11)
+        
+        n_assets = len(self.asset_names)
+        n_rows = (n_assets + 3) // 4
+        n_cols = min(4, n_assets)
+        
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 5*n_rows))
+        if n_rows * n_cols > 1:
+            axes = axes.flatten()
+        else:
+            axes = [axes]
+            
+        for i, asset in enumerate(self.asset_names):
+            if i >= len(axes):
+                break
+                
+            ax = axes[i]
+            
+            times = np.array(self.asset_times[i])
+            prices = np.array(self.asset_prices[i])
+            
+            mask = (times >= training_start) & (times <= training_end)
+            t_train = times[mask]
+            p_train = prices[mask]
+            ax.plot(t_train, p_train, 'b-', label="Real Training Data", linewidth=2)
+            
+            if asset in curve_fit_results:
+                res = curve_fit_results[asset]
+                model_name = res.get("model_name", "CurveFit")
+                
+                recon_times, recon_values = res["full_reconstruction"]
+                ax.plot(recon_times, recon_values, 'r-', label=f"Market-Adjusted {model_name}", linewidth=2)
+                
+                if show_raw and "raw_forecast" in res:
+                    raw_times, raw_values = res["raw_forecast"]
+                    t_combined = np.concatenate([t_train, raw_times])
+                    p_combined = np.concatenate([res["model_predictions"][1], raw_values])
+                    ax.plot(t_combined, p_combined, 'g--', label=f"Raw {model_name}", linewidth=1, alpha=0.6)
+                
+                ax.scatter([res["training_end"]], [res["price_at_training"]], 
+                           marker='o', color='green', s=100, label=f"Model at Training End")
+                ax.scatter([res["training_end"]], [res["actual_last_price"]],
+                           marker='*', color='blue', s=100, label=f"Actual Last Price")
+                ax.scatter([res["forecast_time"]], [res["price_at_forecast"]], 
+                           marker='x', color='red', s=100, label=f"Forecast")
+                
+                market_info = res.get("market_info", {})
+                if "peak_indices" in market_info and "trough_indices" in market_info:
+                    peak_indices = market_info["peak_indices"]
+                    trough_indices = market_info["trough_indices"]
+                    
+                    if len(peak_indices) > 0:
+                        ax.scatter(times[peak_indices], prices[peak_indices], 
+                                  marker='^', color='orange', s=80, alpha=0.6, label="Peaks")
+                    
+                    if len(trough_indices) > 0:
+                        ax.scatter(times[trough_indices], prices[trough_indices], 
+                                  marker='v', color='purple', s=80, alpha=0.6, label="Troughs")
+                
+                predicted_return = res["predicted_return"]
+                ax.set_title(f"{asset} - {model_name} (Return from actual: {predicted_return:.2f}%)")
+            else:
+                ax.set_title(asset)
+                
             ax.set_xlabel("Time")
             ax.set_ylabel("Price")
-            ax.legend(fontsize='small')
-
-        # Remove any unused subplots.
-        for j in range(num_assets, len(axes)):
+            ax.legend(fontsize=8)
+            ax.grid(True, linestyle='--', alpha=0.7)
+        
+        for j in range(i+1, len(axes)):
             fig.delaxes(axes[j])
-
+            
         plt.tight_layout()
         plt.show()
-
-        print(f"Found {len(self.asset_names)} assets.")
-        print("First few asset names:", self.asset_names[:5])
-        return self.asset_names, self.asset_times, self.asset_prices
+        
+        print("\nSummary of Market-Aware Predictions for Each Asset:")
+        print(f"{'Asset':<20} {'Best Model':<15} {'Actual Last':>15} {'Forecast Price':>15} {'Expected Return':>15}")
+        print("-" * 80)
+        
+        for asset in self.asset_names:
+            if asset in curve_fit_results:
+                res = curve_fit_results[asset]
+                model_name = res.get("model_name", "CurveFit")
+                actual_price = res["actual_last_price"]
+                forecast_price = res["price_at_forecast"]
+                expected_return = res["predicted_return"]
+                
+                print(f"{asset:<20} {model_name:<15} {actual_price:15.4f} {forecast_price:15.4f} {expected_return:15.2f}%")
+                
+        positive_returns = [res["predicted_return"] for asset, res in curve_fit_results.items() 
+                           if res["predicted_return"] > 0]
+        negative_returns = [res["predicted_return"] for asset, res in curve_fit_results.items() 
+                           if res["predicted_return"] <= 0]
+        
+        print("\nAggregate Statistics:")
+        print(f"Assets with positive returns: {len(positive_returns)} ({len(positive_returns)/len(curve_fit_results)*100:.1f}%)")
+        print(f"Assets with negative returns: {len(negative_returns)} ({len(negative_returns)/len(curve_fit_results)*100:.1f}%)")
+        
+        if positive_returns:
+            print(f"Average positive return: {np.mean(positive_returns):.2f}%")
+        if negative_returns:
+            print(f"Average negative return: {np.mean(negative_returns):.2f}%")
+        
+        print(f"Overall average expected return: {np.mean([res['predicted_return'] for res in curve_fit_results.values()]):.2f}%")
+        
+        return curve_fit_results
 
     def baseline_forecast(self):
-        """
-        Simple linear forecast using a least-squares linear fit.
-        For each asset:
-          - Uses the entire data as training (from first to last time point).
-          - Forecasts to time = (last time + 100).
-        Returns a dictionary with forecast details.
-        """
         baseline_pred = {}
         for i, name in enumerate(self.asset_names):
             times = np.array(self.asset_times[i])
@@ -129,614 +524,18 @@ class StockPredictor:
             model_predictions = np.polyval(coeffs, t_used)
             price_at_training = np.polyval(coeffs, training_end)
             price_at_forecast = np.polyval(coeffs, forecast_time)
-            predicted_return = (price_at_forecast - price_at_training) / price_at_training
+            predicted_return = ((price_at_forecast / price_at_training) - 1) * 100
             recon_times = np.linspace(training_start, forecast_time, int(forecast_time - training_start))
             linear_reconstruction = np.polyval(coeffs, recon_times)
             baseline_pred[name] = {
                 "model_predictions": (t_used, model_predictions),
                 "full_reconstruction": (recon_times, linear_reconstruction),
                 "price_at_training": price_at_training,
+                "actual_last_price": p_used[-1],
                 "price_at_forecast": price_at_forecast,
-                "predicted_return": predicted_return,
+                "predicted_return": ((price_at_forecast / p_used[-1]) - 1) * 100,
                 "training_end": training_end,
-                "forecast_time": forecast_time
+                "forecast_time": forecast_time,
+                "model_name": "Linear"
             }
         return baseline_pred
-
-    def _build_candidate_library(self, x, candidate_frequencies):
-        """
-        Build a design matrix with a constant, linear, quadratic term,
-        and for each candidate frequency, sine and cosine functions.
-        """
-        features = []
-        feature_names = []
-        features.append(np.ones_like(x))
-        feature_names.append('1')
-        features.append(x)
-        feature_names.append('x')
-        features.append(x**2)
-        feature_names.append('x^2')
-        for w in candidate_frequencies:
-            features.append(np.sin(2 * np.pi * w * x))
-            feature_names.append(f'sin(2π*{w:.2f}x)')
-            features.append(np.cos(2 * np.pi * w * x))
-            feature_names.append(f'cos(2π*{w:.2f}x)')
-        X = np.column_stack(features)
-        return X, feature_names
-
-    def sparse_forecast(self, alpha=0.01):
-        """
-        Sparse regression forecast using FFT-based candidate frequencies and LASSO.
-        For each asset the training period is taken as the full dataset,
-        and the forecast time is set to training_end + 100.
-        """
-        sparse_pred = {}
-        for i, name in enumerate(self.asset_names):
-            times = np.array(self.asset_times[i])
-            prices = np.array(self.asset_prices[i])
-            training_start = times[0]
-            training_end = times[-1]
-            forecast_time = training_end + 100
-
-            prices_denoised = savgol_filter(prices, window_length=11, polyorder=2)
-            mask = (times >= training_start) & (times <= training_end)
-            t_train = times[mask]
-            p_train_denoised = prices_denoised[mask]
-            N = len(t_train)
-            T = t_train[1] - t_train[0] if N > 1 else 1
-            fft_vals = np.fft.fft(p_train_denoised)
-            freq = np.fft.fftfreq(N, T)
-            pos_mask = freq > 0
-            freq_pos = freq[pos_mask]
-            fft_magnitude = np.abs(fft_vals)[pos_mask]
-            threshold = np.mean(fft_magnitude) + np.std(fft_magnitude)
-            candidate_frequencies = freq_pos[fft_magnitude > threshold]
-            candidate_frequencies = np.unique(np.round(candidate_frequencies, 2))
-            p_train_raw = prices[mask]
-            coeffs_trend = np.polyfit(t_train, p_train_raw, 1)
-            trend_train = np.polyval(coeffs_trend, t_train)
-            p_train_detrended = p_train_denoised - trend_train
-            X, _ = self._build_candidate_library(times, candidate_frequencies)
-            X_train = X[mask, :]
-            lasso = Lasso(alpha=alpha, max_iter=10000)
-            lasso.fit(X_train, p_train_detrended)
-            coefs = lasso.coef_
-            intercept_sparse = lasso.intercept_
-            p_detrended_reconstructed = intercept_sparse + X.dot(coefs)
-            trend_full = np.polyval(coeffs_trend, times)
-            p_reconstructed = np.maximum(p_detrended_reconstructed + trend_full, 0)
-            def predict_new(x_new):
-                X_new, _ = self._build_candidate_library(np.array([x_new]), candidate_frequencies)
-                value = intercept_sparse + X_new.dot(coefs) + np.polyval(coeffs_trend, x_new)
-                return max(value.item(), 0)
-            price_at_training = predict_new(training_end)
-            price_at_forecast = predict_new(forecast_time)
-            predicted_return = (price_at_forecast - price_at_training) / price_at_training
-            recon_times = np.linspace(training_start, forecast_time, int(forecast_time - training_start))
-            X_new, _ = self._build_candidate_library(recon_times, candidate_frequencies)
-            p_detrended_new = intercept_sparse + X_new.dot(coefs)
-            p_reconstructed_new = np.maximum(p_detrended_new + np.polyval(coeffs_trend, recon_times), 0)
-            sparse_pred[name] = {
-                "model_predictions": (t_train, np.maximum(p_reconstructed[mask], 0)),
-                "full_reconstruction": (recon_times, p_reconstructed_new),
-                "price_at_training": price_at_training,
-                "price_at_forecast": price_at_forecast,
-                "predicted_return": predicted_return,
-                "training_end": training_end,
-                "forecast_time": forecast_time
-            }
-        return sparse_pred
-
-    def arima_forecast(self, order=(1, 1, 1), use_log=True):
-        """
-        ARIMA forecast. For each asset the training period is the full dataset,
-        and forecast time is training_end + 100.
-        """
-        arima_pred = {}
-        for i, name in enumerate(self.asset_names):
-            times = np.array(self.asset_times[i])
-            prices = np.array(self.asset_prices[i])
-            training_start = times[0]
-            training_end = times[-1]
-            forecast_time = training_end + 100
-
-            mask = (times >= training_start) & (times <= training_end)
-            t_train = times[mask]
-            p_train = prices[mask]
-            if use_log:
-                if np.any(p_train <= 0):
-                    raise ValueError(f"Asset {name} has non-positive prices; cannot use log transform.")
-                p_train_trans = np.log(p_train)
-            else:
-                p_train_trans = p_train.copy()
-            try:
-                model = ARIMA(p_train_trans, order=order)
-                model_fit = model.fit()
-            except Exception as e:
-                print(f"ARIMA fit failed for asset {name}: {e}")
-                continue
-            pred_train_trans = model_fit.predict(start=0, end=len(p_train_trans) - 1)
-            if use_log:
-                pred_train = np.exp(pred_train_trans)
-            else:
-                pred_train = pred_train_trans
-            forecast_steps = int(forecast_time - training_end)
-            if forecast_steps <= 0:
-                raise ValueError("Forecast time must be greater than training end.")
-            forecast_trans = model_fit.forecast(steps=forecast_steps)
-            if use_log:
-                forecast_values = np.exp(forecast_trans)
-            else:
-                forecast_values = forecast_trans
-            forecast_times = np.arange(training_end + 1, forecast_time + 1)
-            full_times = np.concatenate([t_train, forecast_times])
-            full_predictions = np.maximum(np.concatenate([pred_train, forecast_values]), 0)
-            price_at_training = pred_train[-1]
-            price_at_forecast = forecast_values[-1]
-            predicted_return = (price_at_forecast - price_at_training) / price_at_training
-            arima_pred[name] = {
-                "model_predictions": (t_train, pred_train),
-                "full_reconstruction": (full_times, full_predictions),
-                "price_at_training": price_at_training,
-                "price_at_forecast": price_at_forecast,
-                "predicted_return": predicted_return,
-                "training_end": training_end,
-                "forecast_time": forecast_time
-            }
-        return arima_pred
-
-    def exponential_smoothing_forecast(self, trend='add', seasonal=None, seasonal_periods=None,
-                                         use_multiplicative=False):
-        """
-        Forecast using Exponential Smoothing.
-        For each asset the training period is the full dataset,
-        and forecast time is training_end + 100.
-        """
-        exp_pred = {}
-        for i, name in enumerate(self.asset_names):
-            times = np.array(self.asset_times[i])
-            prices = np.array(self.asset_prices[i])
-            training_start = times[0]
-            training_end = times[-1]
-            forecast_time = training_end + 100
-
-            mask = (times >= training_start) & (times <= training_end)
-            t_train = times[mask]
-            p_train = prices[mask]
-            if use_multiplicative:
-                if np.any(p_train <= 0):
-                    print(f"Warning: Asset {name} has non-positive values. Multiplicative model not appropriate. Using additive model.")
-                else:
-                    trend = 'mul'
-                    if seasonal is not None:
-                        seasonal = 'mul'
-            try:
-                model = ExponentialSmoothing(p_train, trend=trend, seasonal=seasonal, seasonal_periods=seasonal_periods)
-                model_fit = model.fit()
-            except Exception as e:
-                print(f"Exponential Smoothing model fit failed for asset {name}: {e}")
-                continue
-            pred_train = np.maximum(model_fit.fittedvalues, 0)
-            forecast_steps = int(forecast_time - training_end)
-            if forecast_steps <= 0:
-                raise ValueError("Forecast time must be greater than training end.")
-            forecast_values = np.maximum(model_fit.forecast(steps=forecast_steps), 0)
-            forecast_times = np.arange(training_end + 1, forecast_time + 1)
-            full_times = np.concatenate([t_train, forecast_times])
-            full_predictions = np.maximum(np.concatenate([pred_train, forecast_values]), 0)
-            price_at_training = pred_train[-1]
-            price_at_forecast = forecast_values[-1]
-            predicted_return = (price_at_forecast - price_at_training) / price_at_training
-            exp_pred[name] = {
-                "model_predictions": (t_train, pred_train),
-                "full_reconstruction": (full_times, full_predictions),
-                "price_at_training": price_at_training,
-                "price_at_forecast": price_at_forecast,
-                "predicted_return": predicted_return,
-                "training_end": training_end,
-                "forecast_time": forecast_time
-            }
-        return exp_pred
-
-    def naive_forecast(self, strategy="last"):
-        """
-        Naive forecast using sktime's NaiveForecaster.
-        For each asset the training period is the full dataset,
-        and forecast time is training_end + 100.
-        """
-        naive_pred = {}
-        for i, name in enumerate(self.asset_names):
-            times = np.array(self.asset_times[i])
-            prices = np.array(self.asset_prices[i])
-            training_start = times[0]
-            training_end = times[-1]
-            forecast_time = training_end + 100
-
-            mask = (times >= training_start) & (times <= training_end)
-            t_train = times[mask]
-            p_train = prices[mask]
-            if strategy == "last":
-                in_sample_predictions = np.empty_like(p_train)
-                in_sample_predictions[0] = p_train[0]
-                if len(p_train) > 1:
-                    in_sample_predictions[1:] = p_train[:-1]
-            elif strategy == "drift":
-                if len(p_train) > 1:
-                    drift = (p_train[-1] - p_train[0]) / (len(p_train) - 1)
-                else:
-                    drift = 0
-                in_sample_predictions = np.empty_like(p_train)
-                in_sample_predictions[0] = p_train[0]
-                for j in range(1, len(p_train)):
-                    in_sample_predictions[j] = p_train[j - 1] + drift
-            elif strategy == "mean":
-                mean_value = np.mean(p_train)
-                in_sample_predictions = np.full_like(p_train, fill_value=mean_value)
-            else:
-                raise ValueError("Unsupported strategy. Use 'last', 'drift', or 'mean'.")
-            in_sample_predictions = np.maximum(in_sample_predictions, 0)
-            forecast_steps = int(forecast_time - training_end)
-            if forecast_steps <= 0:
-                raise ValueError("Forecast time must be greater than training end.")
-            y_train = pd.Series(p_train, index=pd.RangeIndex(start=int(t_train[0]),
-                                                             stop=int(t_train[0]) + len(t_train)))
-            forecaster = NaiveForecaster(strategy=strategy)
-            forecaster.fit(y_train)
-            fh = np.arange(1, forecast_steps + 1)
-            y_forecast = forecaster.predict(fh)
-            forecast_values = np.maximum(y_forecast.values, 0)
-            forecast_times = np.arange(training_end + 1, forecast_time + 1)
-            full_times = np.concatenate([t_train, forecast_times])
-            full_predictions = np.concatenate([in_sample_predictions, forecast_values])
-            price_at_training = p_train[-1]
-            price_at_forecast = forecast_values[-1]
-            predicted_return = (price_at_forecast - price_at_training) / price_at_training
-            naive_pred[name] = {
-                "model_predictions": (t_train, in_sample_predictions),
-                "full_reconstruction": (full_times, full_predictions),
-                "price_at_training": price_at_training,
-                "price_at_forecast": price_at_forecast,
-                "predicted_return": predicted_return,
-                "training_end": training_end,
-                "forecast_time": forecast_time
-            }
-        return naive_pred
-
-    def decision_tree_forecast(self, seasonal_period=50, max_depth=50):
-        """
-        Forecast using a Decision Tree Regressor with conditional deseasonalization.
-        For each asset the training period is the full dataset,
-        and forecast time is training_end + 100.
-        """
-        dt_pred = {}
-        for i, name in enumerate(self.asset_names):
-            times = np.array(self.asset_times[i])
-            prices = np.array(self.asset_prices[i])
-            training_start = times[0]
-            training_end = times[-1]
-            forecast_time = training_end + 100
-
-            mask = (times >= training_start) & (times <= training_end)
-            t_train = times[mask]
-            p_train = prices[mask]
-            coeffs = np.polyfit(t_train, p_train, deg=1)
-            trend_train = np.polyval(coeffs, t_train)
-            p_detrended = p_train - trend_train
-            if seasonal_period is not None and seasonal_period > 1:
-                seasonal_effect = np.zeros(seasonal_period)
-                count = np.zeros(seasonal_period)
-                for idx, t in enumerate(t_train):
-                    pos = int((t - training_start) % seasonal_period)
-                    seasonal_effect[pos] += p_detrended[idx]
-                    count[pos] += 1
-                seasonal_effect = np.where(count > 0, seasonal_effect / count, 0)
-                seasonal_train = np.array([seasonal_effect[int((t - training_start) % seasonal_period)]
-                                           for t in t_train])
-                p_deseasonalized = p_detrended - seasonal_train
-            else:
-                p_deseasonalized = p_detrended
-                seasonal_train = np.zeros_like(p_train)
-            dt_reg = DecisionTreeRegressor(max_depth=max_depth)
-            dt_reg.fit(t_train.reshape(-1, 1), p_deseasonalized)
-            pred_deseasonalized_train = dt_reg.predict(t_train.reshape(-1, 1))
-            pred_train_reconstructed = pred_deseasonalized_train + trend_train
-            if seasonal_period is not None and seasonal_period > 1:
-                pred_train_reconstructed += seasonal_train
-            forecast_times = np.arange(training_end + 1, forecast_time + 1)
-            pred_deseasonalized_forecast = dt_reg.predict(forecast_times.reshape(-1, 1))
-            trend_forecast = np.polyval(coeffs, forecast_times)
-            if seasonal_period is not None and seasonal_period > 1:
-                seasonal_forecast = np.array([seasonal_effect[int((t - training_start) % seasonal_period)]
-                                              for t in forecast_times])
-            else:
-                seasonal_forecast = np.zeros_like(forecast_times)
-            forecast_pred = pred_deseasonalized_forecast + trend_forecast + seasonal_forecast
-            full_times = np.concatenate([t_train, forecast_times])
-            full_predictions = np.concatenate([pred_train_reconstructed, forecast_pred])
-            price_at_training = pred_train_reconstructed[-1]
-            price_at_forecast = forecast_pred[-1]
-            predicted_return = (price_at_forecast - price_at_training) / price_at_training
-            dt_pred[name] = {
-                "model_predictions": (t_train, pred_train_reconstructed),
-                "full_reconstruction": (full_times, full_predictions),
-                "price_at_training": price_at_training,
-                "price_at_forecast": price_at_forecast,
-                "predicted_return": predicted_return,
-                "training_end": training_end,
-                "forecast_time": forecast_time
-            }
-        return dt_pred
-
-    def _create_dataset(self, data, look_back):
-        """
-        Helper function to create sliding-window sequences.
-        Returns X (inputs) and y (targets).
-        """
-        X, y = [], []
-        for i in range(len(data) - look_back):
-            X.append(data[i:i + look_back])
-            y.append(data[i + look_back])
-        return np.array(X), np.array(y)
-
-    def rnn_forecast(self, look_back=10, epochs=20, batch_size=64):
-        """
-        Forecast using a simple RNN. Creates sliding-window sequences,
-        trains an RNN on normalized training data, and then recursively forecasts.
-        For each asset the training period is the full dataset,
-        and forecast time is training_end + 100.
-        """
-        rnn_pred = {}
-        for i, name in enumerate(self.asset_names):
-            times = np.array(self.asset_times[i])
-            prices = np.array(self.asset_prices[i])
-            training_start = times[0]
-            training_end = times[-1]
-            forecast_time = training_end + 100
-
-            mask = (times >= training_start) & (times <= training_end)
-            t_train = times[mask]
-            p_train = prices[mask]
-            if len(p_train) <= look_back:
-                raise ValueError(f"Not enough training data for asset {name} with look_back = {look_back}.")
-            train_min = p_train.min()
-            train_max = p_train.max()
-            p_train_norm = (p_train - train_min) / (train_max - train_min)
-            X_train, y_train = self._create_dataset(p_train_norm, look_back)
-            X_train = X_train.reshape((X_train.shape[0], X_train.shape[1], 1))
-            model = Sequential()
-            model.add(SimpleRNN(units=50, return_sequences=True, input_shape=(X_train.shape[1], 1)))
-            model.add(SimpleRNN(units=50, return_sequences=False))
-            model.add(Dense(units=1))
-            model.compile(optimizer='adam', loss='mean_squared_error')
-            model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, verbose=0)
-            pred_train_norm = model.predict(X_train, verbose=0).flatten()
-            pred_train = pred_train_norm * (train_max - train_min) + train_min
-            pred_train = np.maximum(pred_train, 0)
-            t_train_pred = t_train[look_back:]
-            forecast_steps = int(forecast_time - training_end)
-            if forecast_steps <= 0:
-                raise ValueError("Forecast time must be greater than training end.")
-            last_sequence = p_train_norm[-look_back:].tolist()
-            forecasted_norm = []
-            for _ in range(forecast_steps):
-                input_seq = np.array(last_sequence[-look_back:]).reshape((1, look_back, 1))
-                next_val_norm = model.predict(input_seq, verbose=0)[0, 0]
-                forecasted_norm.append(next_val_norm)
-                last_sequence.append(next_val_norm)
-            forecasted = np.array(forecasted_norm) * (train_max - train_min) + train_min
-            forecasted = np.maximum(forecasted, 0)
-            forecast_times = np.arange(training_end + 1, forecast_time + 1)
-            full_times = np.concatenate([t_train_pred, forecast_times])
-            full_predictions = np.concatenate([pred_train, forecasted])
-            full_predictions = np.maximum(full_predictions, 0)
-            price_at_training = pred_train[-1]
-            price_at_forecast = forecasted[-1]
-            predicted_return = (price_at_forecast - price_at_training) / price_at_training
-            rnn_pred[name] = {
-                "model_predictions": (t_train_pred, pred_train),
-                "full_reconstruction": (full_times, full_predictions),
-                "price_at_training": price_at_training,
-                "price_at_forecast": price_at_forecast,
-                "predicted_return": predicted_return,
-                "training_end": training_end,
-                "forecast_time": forecast_time
-            }
-        return rnn_pred
-
-    def aggregate_and_plot_mean_median(self, methods, training_start=0, training_end=100, forecast_time=200):
-        """
-        For each asset, this function:
-          - Prints a table of predicted training price, forecast price, and expected return (in %)
-            for each forecasting method in the provided 'methods' dictionary.
-          - Computes the pointwise median and mean forecasts across the selected methods.
-          - Displays two separate 5×4 grids: one for the median forecast and one for the mean forecast.
-        
-        Expected return is computed as (forecast / training_price)*100%.
-        
-        Returns a dictionary with two keys: "median" and "mean". Each value is a dictionary where each asset
-        is represented with keys:
-          - "model_predictions": (training_times, aggregated in-sample predictions) – the training period is filled with the aggregated training price.
-          - "full_reconstruction": (common_times, aggregated full forecast)
-          - "price_at_training": aggregated training price (scalar)
-          - "price_at_forecast": aggregated forecast price (scalar)
-          - "predicted_return": aggregated expected return (scalar)
-        """
-        # 'methods' is a dictionary mapping method names to forecast result dictionaries.
-        # Create a common time axis.
-        common_times = np.linspace(training_start, forecast_time, int(forecast_time - training_start))
-        
-        # Containers for aggregated results.
-        median_results = {}
-        mean_results = {}
-        
-        # Loop over assets.
-        for idx, asset in enumerate(self.asset_names):
-            print(f"\n{'='*60}\nAsset: {asset}")
-            
-            # Get asset training data.
-            times = np.array(self.asset_times[idx])
-            prices = np.array(self.asset_prices[idx])
-            mask = (times >= training_start) & (times <= training_end)
-            t_train = times[mask]
-            real_training_price = prices[mask][-1]
-            print(f"Real training price (last value in training data): {real_training_price:.4f}")
-            
-            # Initialize lists to collect scalar predictions and aligned full forecasts.
-            training_preds = []    # from each method: price_at_training
-            forecast_preds = []    # from each method: price_at_forecast
-            exp_returns = []       # expected return in percentage
-            full_predictions_aligned = []  # each element is an array aligned on common_times
-            
-            # Print table header.
-            header = f"{'Method':<15} {'TrainPred':>10} {'Forecast':>10} {'Return (%)':>12}"
-            print(header)
-            print("-" * len(header))
-            
-            for method_name, result in methods.items():
-                if asset not in result:
-                    continue
-                res = result[asset]
-                train_pred = res["price_at_training"]
-                forecast_pred = res["price_at_forecast"]
-                exp_return = (forecast_pred / train_pred) * 100.0
-                print(f"{method_name:<15} {train_pred:10.4f} {forecast_pred:10.4f} {exp_return:12.2f}")
-                training_preds.append(train_pred)
-                forecast_preds.append(forecast_pred)
-                exp_returns.append(exp_return)
-                # Interpolate full reconstruction on common_times.
-                method_times, method_preds = res["full_reconstruction"]
-                aligned = np.interp(common_times, method_times, method_preds)
-                full_predictions_aligned.append(aligned)
-            
-            # Compute aggregated scalar values.
-            median_train = np.median(training_preds)
-            median_forecast = np.median(forecast_preds)
-            median_return = np.median(exp_returns)
-            mean_train = np.mean(training_preds)
-            mean_forecast = np.mean(forecast_preds)
-            mean_return = np.mean(exp_returns)
-            print("-" * len(header))
-            print(f"{'Median':<15} {median_train:10.4f} {median_forecast:10.4f} {median_return:12.2f}")
-            print(f"{'Mean':<15} {mean_train:10.4f} {mean_forecast:10.4f} {mean_return:12.2f}")
-            
-            # Compute pointwise aggregated forecasts.
-            full_predictions_aligned = np.array(full_predictions_aligned)
-            median_full = np.median(full_predictions_aligned, axis=0)
-            mean_full = np.mean(full_predictions_aligned, axis=0)
-            
-            # Save aggregated results for this asset.
-            median_results[asset] = {
-                "model_predictions": (t_train, np.full_like(t_train, median_train)),
-                "full_reconstruction": (common_times, median_full),
-                "price_at_training": median_train,
-                "price_at_forecast": median_forecast,
-                "predicted_return": median_return
-            }
-            mean_results[asset] = {
-                "model_predictions": (t_train, np.full_like(t_train, mean_train)),
-                "full_reconstruction": (common_times, mean_full),
-                "price_at_training": mean_train,
-                "price_at_forecast": mean_forecast,
-                "predicted_return": mean_return
-            }
-        
-        # Plotting: Two separate 5x4 charts.
-        n_assets = len(self.asset_names)
-        n_rows, n_cols = 5, 4
-        
-        # Figure for Median forecasts.
-        fig_med, axes_med = plt.subplots(n_rows, n_cols, figsize=(20, 25), sharex=True, sharey=False)
-        axes_med = axes_med.flatten()
-        for idx, asset in enumerate(self.asset_names):
-            ax = axes_med[idx]
-            ax.plot(common_times, median_results[asset]["full_reconstruction"][1],
-                    label="Median Forecast", color='black', linewidth=2)
-            # Plot each method's forecast.
-            for method_name, result in methods.items():
-                if asset in result:
-                    m_times, m_preds = result[asset]["full_reconstruction"]
-                    aligned = np.interp(common_times, m_times, m_preds)
-                    ax.plot(common_times, aligned, label=method_name, linestyle="--", alpha=0.6)
-            # Plot real training data.
-            asset_idx = self.asset_names.index(asset)
-            mask = (np.array(self.asset_times[asset_idx]) >= training_start) & (np.array(self.asset_times[asset_idx]) <= training_end)
-            t_train_real = np.array(self.asset_times[asset_idx])[mask]
-            ax.plot(t_train_real, np.array(self.asset_prices[asset_idx])[mask],
-                    label="Real Training", color="blue", linewidth=2)
-            ax.set_title(asset)
-            ax.set_xlabel("Time")
-            ax.set_ylabel("Price")
-            ax.legend(fontsize=8)
-        for j in range(idx+1, n_rows*n_cols):
-            axes_med[j].axis('off')
-        fig_med.tight_layout()
-        
-        # Figure for Mean forecasts.
-        fig_mean, axes_mean = plt.subplots(n_rows, n_cols, figsize=(20, 25), sharex=True, sharey=False)
-        axes_mean = axes_mean.flatten()
-        for idx, asset in enumerate(self.asset_names):
-            ax = axes_mean[idx]
-            ax.plot(common_times, mean_results[asset]["full_reconstruction"][1],
-                    label="Mean Forecast", color='black', linewidth=2)
-            for method_name, result in methods.items():
-                if asset in result:
-                    m_times, m_preds = result[asset]["full_reconstruction"]
-                    aligned = np.interp(common_times, m_times, m_preds)
-                    ax.plot(common_times, aligned, label=method_name, linestyle="--", alpha=0.6)
-            asset_idx = self.asset_names.index(asset)
-            mask = (np.array(self.asset_times[asset_idx]) >= training_start) & (np.array(self.asset_times[asset_idx]) <= training_end)
-            t_train_real = np.array(self.asset_times[asset_idx])[mask]
-            ax.plot(t_train_real, np.array(self.asset_prices[asset_idx])[mask],
-                    label="Real Training", color="blue", linewidth=2)
-            ax.set_title(asset)
-            ax.set_xlabel("Time")
-            ax.set_ylabel("Price")
-            ax.legend(fontsize=8)
-        for j in range(idx+1, n_rows*n_cols):
-            axes_mean[j].axis('off')
-        fig_mean.tight_layout()
-        
-        plt.show()
-        
-        return {"median": median_results, "mean": mean_results}
-
-
-# Example usage when running as a script.
-if __name__ == "__main__":
-    sp = StockPredictor(data_folder="Bundle2")
-    
-    # Run each forecasting method.
-    linear_results = sp.baseline_forecast()
-    sparse_results = sp.sparse_forecast(alpha=0.01)
-    arima_results = sp.arima_forecast(order=(2, 1, 2), use_log=True)
-    exp_results = sp.exponential_smoothing_forecast(trend='add', seasonal=None, seasonal_periods=None,
-                                                    use_multiplicative=True)
-    naive_results = sp.naive_forecast(strategy="last")
-    dt_results = sp.decision_tree_forecast(seasonal_period=50, max_depth=50)
-    rnn_results = sp.rnn_forecast(look_back=30, epochs=20, batch_size=64)
-    
-    # Optionally, plot individual forecasts.
-    sp.plot_forecasts(linear_results)
-    sp.plot_forecasts(sparse_results)
-    sp.plot_forecasts(arima_results)
-    sp.plot_forecasts(exp_results)
-    sp.plot_forecasts(naive_results)
-    sp.plot_forecasts(dt_results)
-    sp.plot_forecasts(rnn_results)
-    
-    # Create a dictionary of selected methods (dynamically defined).
-    methods = {
-        'RNN': rnn_results,
-        'DecisionTree': dt_results,
-        'Naive': naive_results,
-        'ExpSmoothing': exp_results,
-        'ARIMA': arima_results,
-        'Sparse': sparse_results,
-        'Linear': linear_results
-    }
-    
-    # Aggregate and plot mean and median forecasts.
-    aggregated = sp.aggregate_and_plot_mean_median(methods,
-                                                   training_start=0,
-                                                   training_end=sp.asset_times[0][-1],
-                                                   forecast_time=sp.asset_times[0][-1] + 100)
