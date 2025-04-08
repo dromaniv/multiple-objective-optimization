@@ -129,50 +129,17 @@ class StockPredictor:
     def market_aware_curve_fit_forecast(self, max_attempts=7, reversion_strength=0.6):
         import warnings
         
-        # def model_linear(x, a, b):
-        #     return a * x + b
+        def model_quadratic(x, a, b, c):
+            return a * x**2 + b * x + c
         
-        # def model_quadratic(x, a, b, c):
-        #     return a * x**2 + b * x + c
-        
-        # def model_sin_linear(x, a, b, c, d, e):
-        #     return a * np.sin(b * x + c) + d * x + e
-        
-        # def model_exp(x, a, b, c):
-        #     safe_exp = np.exp(np.minimum(b * x, 700))
-        #     return a * safe_exp + c
-        
-        # def model_log(x, a, b, c):
-        #     with np.errstate(divide='ignore', invalid='ignore'):
-        #         result = a * np.log(np.maximum(b * x, 1e-10)) + c
-        #         invalid_mask = ~np.isfinite(result)
-        #         if np.any(invalid_mask):
-        #             valid_mask = ~invalid_mask
-        #             if np.sum(valid_mask) >= 2:
-        #                 coeffs = np.polyfit(x[valid_mask], result[valid_mask], 1)
-        #                 result[invalid_mask] = np.polyval(coeffs, x[invalid_mask])
-        #             else:
-        #                 result[invalid_mask] = result[~invalid_mask][0] if np.any(~invalid_mask) else 0
-        #         return result
-        
-        # def model_logistic(x, a, b, c, d):
-        #     return a / (1 + b * np.exp(-c * x)) + d
+        def model_sin_linear(x, a, b, c, d, e):
+            return a * np.sin(b * x + c) + d * x + e
         
         def model_damped_sin(x, a, b, c, d, e, f):
             return a * np.exp(-b * x) * np.sin(c * x + d) + e * x + f
         
-        # def model_power(x, a, b, c):
-        #     with np.errstate(divide='ignore', invalid='ignore'):
-        #         result = a * np.power(np.maximum(x, 1e-10), b) + c
-        #         invalid_mask = ~np.isfinite(result)
-        #         if np.any(invalid_mask):
-        #             valid_mask = ~invalid_mask
-        #             if np.sum(valid_mask) >= 2:
-        #                 coeffs = np.polyfit(x[valid_mask], result[valid_mask], 1)
-        #                 result[invalid_mask] = np.polyval(coeffs, x[invalid_mask])
-        #             else:
-        #                 result[invalid_mask] = 0
-        #         return result
+        def model_double_sin(x, a, b, c, d, e, f, g):
+            return a * np.sin(b * x + c) + d * np.sin(e * x + f) + g
         
         def model_holt_winters(x, level, trend, season1, season2, period=50):
             result = np.zeros_like(x, dtype=float)
@@ -181,20 +148,24 @@ class StockPredictor:
                 result[i] = level + trend * t + season1 * cycle + season2 * np.cos(2 * np.pi * t / period)
             return result
         
-        # def model_fourier(x, a0, a1, b1, a2, b2, w):
-        #     return a0 + a1 * np.cos(w * x) + b1 * np.sin(w * x) + a2 * np.cos(2 * w * x) + b2 * np.sin(2 * w * x)
+        def model_sin_x_linear(x, a, b, c, d):
+            return a * np.sin(b * x + c) * x + d
+        
+        def model_composite(x, a, b, c, d, e, f, g, h):
+            sin_comp = a * np.sin(b * x + c)
+            trend_comp = d * x + e
+            damping = np.exp(-f * x)
+            modulation = g * np.sin(h * x + 0.5)
+            return sin_comp + trend_comp + damping * modulation
         
         models = [
-            # (model_linear, "Linear"),
-            # (model_quadratic, "Quadratic"),
-            # (model_sin_linear, "Sin+Linear"),
-            # (model_log, "Logarithmic"),
-            # (model_logistic, "Logistic"),
-            # (model_power, "Power"),
-            # (model_fourier, "Fourier"),
-            (model_holt_winters, "HoltWinters"),
             (model_damped_sin, "DampedSin"),
-            # (model_exp, "Exponential")
+            (model_holt_winters, "HoltWinters"),
+            (model_double_sin, "DoubleSin"),
+            (model_composite, "Composite"),
+            (model_sin_x_linear, "SinXLinear"),
+            (model_sin_linear, "SinLinear"),
+            (model_quadratic, "Quadratic")
         ]
         
         curve_fit_pred = {}
@@ -236,10 +207,6 @@ class StockPredictor:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         
-                        if model_name == "Exponential" and (price_max / max(price_min, 0.001) > 100):
-                            print(f"  Skipping {model_name} due to large price range")
-                            continue
-                        
                         p0 = np.ones(model_func.__code__.co_argcount - 1)
                         
                         if model_name == "Quadratic":
@@ -251,25 +218,61 @@ class StockPredictor:
                             p0[1] = 0  # trend
                             p0[2] = 0.1  # season1
                             p0[3] = 0.1  # season2
-                        elif model_name == "Fourier":
-                            if market_info['avg_cycle_length']:
-                                p0[5] = 2 * np.pi / market_info['avg_cycle_length']  # omega
+                        elif model_name == "DampedSin":
+                            p0[0] = (price_max - price_min) / 2  # amplitude
+                            p0[1] = 0.01  # damping
+                            if market_info['avg_cycle_length'] and market_info['avg_cycle_length'] > 0:
+                                p0[2] = 2 * np.pi / market_info['avg_cycle_length']  # frequency
                             else:
-                                p0[5] = 0.1
+                                p0[2] = 0.1
+                            p0[3] = 0  # phase
+                            p0[4] = 0  # trend
+                            p0[5] = price_mean  # offset
+                        elif model_name == "DoubleSin":
+                            p0[0] = (price_max - price_min) / 2  # amplitude 1
+                            if market_info['avg_cycle_length'] and market_info['avg_cycle_length'] > 0:
+                                p0[1] = 2 * np.pi / market_info['avg_cycle_length']  # frequency 1
+                            else:
+                                p0[1] = 0.1
+                            p0[2] = 0  # phase 1
+                            p0[3] = (price_max - price_min) / 4  # amplitude 2
+                            p0[4] = p0[1] * 2  # frequency 2 (higher)
+                            p0[5] = np.pi/2  # phase 2
+                            p0[6] = price_mean  # offset
+                        elif model_name == "Composite":
+                            p0[0] = (price_max - price_min) / 2  # sin amplitude
+                            if market_info['avg_cycle_length'] and market_info['avg_cycle_length'] > 0:
+                                p0[1] = 2 * np.pi / market_info['avg_cycle_length']  # frequency
+                            else:
+                                p0[1] = 0.1
+                            p0[2] = 0  # phase
+                            p0[3] = 0  # trend slope
+                            p0[4] = price_mean  # level
+                            p0[5] = 0.005  # damping
+                            p0[6] = (price_max - price_min) / 4  # modulation amplitude
+                            p0[7] = p0[1] * 3  # modulation frequency
                         
                         bounds = ([-1000] * len(p0), [1000] * len(p0))
                         
-                        if model_name == "Sin+Linear":
-                            bounds[0][1] = 0.001
-                            bounds[1][1] = 10
-                        elif model_name == "DampedSin":
-                            bounds[0][1] = 0.0001
-                            bounds[1][1] = 0.1
-                            bounds[0][2] = 0.001
-                            bounds[1][2] = 10
-                            p0[1] = 0.01
-                            p0[2] = 0.1
-                        elif model_name == "Logistic":
+                        if model_name in ["DampedSin", "DoubleSin", "SinLinear", "SinXLinear"]:
+                            for freq_idx in [2] if model_name == "DampedSin" else [1, 4] if model_name == "DoubleSin" else [1]:
+                                if freq_idx < len(bounds[0]):
+                                    bounds[0][freq_idx] = 0.001  # Min frequency
+                                    bounds[1][freq_idx] = 10     # Max frequency
+                        
+                        if model_name == "DampedSin":
+                            bounds[0][1] = 0.0001  # Min damping
+                            bounds[1][1] = 0.1     # Max damping
+                        
+                        if model_name == "Composite":
+                            bounds[0][1] = 0.001  # Min sine frequency
+                            bounds[1][1] = 10     # Max sine frequency
+                            bounds[0][5] = 0      # Min damping
+                            bounds[1][5] = 0.1    # Max damping
+                            bounds[0][7] = 0.001  # Min modulation frequency
+                            bounds[1][7] = 20     # Max modulation frequency
+                        
+                        if model_name == "Logistic":
                             mid_x = np.mean(t_train)
                             p0[0] = price_max - price_min
                             p0[1] = 1.0
@@ -277,19 +280,12 @@ class StockPredictor:
                             p0[3] = price_min
                             bounds[0][2] = 0.001
                             bounds[1][2] = 1.0
-                        elif model_name == "Exponential":
-                            p0[1] = 0.001
-                            bounds[0][1] = -0.1
-                            bounds[1][1] = 0.1
-                        elif model_name == "Fourier":
-                            bounds[0][5] = 0.001  # min frequency
-                            bounds[1][5] = 10.0  # max frequency
                         
                         params, _ = curve_fit(
                             model_func, t_train, p_train,
                             p0=p0,
                             bounds=bounds,
-                            maxfev=20000,
+                            maxfev=15000,
                             method='trf'
                         )
                         
@@ -520,20 +516,24 @@ class StockPredictor:
             mask = (times >= training_start) & (times <= training_end)
             t_used = times[mask]
             p_used = prices[mask]
+            actual_last_price = p_used[-1]
+            
             coeffs = np.polyfit(t_used, p_used, deg=1)
             model_predictions = np.polyval(coeffs, t_used)
             price_at_training = np.polyval(coeffs, training_end)
             price_at_forecast = np.polyval(coeffs, forecast_time)
-            predicted_return = ((price_at_forecast / price_at_training) - 1) * 100
+            predicted_return = ((price_at_forecast / actual_last_price) - 1) * 100
+            
             recon_times = np.linspace(training_start, forecast_time, int(forecast_time - training_start))
             linear_reconstruction = np.polyval(coeffs, recon_times)
+            
             baseline_pred[name] = {
                 "model_predictions": (t_used, model_predictions),
                 "full_reconstruction": (recon_times, linear_reconstruction),
                 "price_at_training": price_at_training,
-                "actual_last_price": p_used[-1],
+                "actual_last_price": actual_last_price,
                 "price_at_forecast": price_at_forecast,
-                "predicted_return": ((price_at_forecast / p_used[-1]) - 1) * 100,
+                "predicted_return": predicted_return,
                 "training_end": training_end,
                 "forecast_time": forecast_time,
                 "model_name": "Linear"
