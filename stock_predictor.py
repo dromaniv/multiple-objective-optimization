@@ -6,7 +6,8 @@ from scipy.optimize import curve_fit
 from scipy.signal import find_peaks
 
 class StockPredictor:
-    def __init__(self, data_folder="Bundle2"):
+    def __init__(self, data_folder="Bundle2", verbose=False):
+        self.verbose = verbose
         self.data_folder = data_folder
         self.asset_names, self.asset_times, self.asset_prices = self.load_data()
 
@@ -171,7 +172,8 @@ class StockPredictor:
         curve_fit_pred = {}
         
         for i, name in enumerate(self.asset_names):
-            print(f"Processing asset: {name}")
+            if self.verbose:
+                print(f"Processing asset: {name}")
             times = np.array(self.asset_times[i])
             prices = np.array(self.asset_prices[i])
             training_start = times[0]
@@ -179,11 +181,13 @@ class StockPredictor:
             forecast_time = training_end + 100
             
             market_info = self.analyze_market_cycles(times, prices)
-            print(f"  Market trend: {market_info['trend']}, Position: {market_info.get('cycle_position', 'unknown')}")
-            print(f"  Volatility: {market_info['volatility']:.4f}")
+            if self.verbose:
+                print(f"  Market trend: {market_info['trend']}, Position: {market_info.get('cycle_position', 'unknown')}")
+                print(f"  Volatility: {market_info['volatility']:.4f}")
             
             if market_info['avg_cycle_length']:
-                print(f"  Average cycle length: {market_info['avg_cycle_length']:.2f}")
+                if self.verbose:
+                    print(f"  Average cycle length: {market_info['avg_cycle_length']:.2f}")
             
             mask = (times >= training_start) & (times <= training_end)
             t_train = times[mask]
@@ -298,15 +302,17 @@ class StockPredictor:
                             best_model_name = model_name
                             best_params = params
                             best_predictions = predictions
-                    
-                    print(f"  Tried {model_name}: MSE = {mse:.4f}")
+                    if self.verbose:
+                        print(f"  Tried {model_name}: MSE = {mse:.4f}")
                     
                 except Exception as e:
-                    print(f"  {model_name} fitting failed: {str(e)}")
+                    if self.verbose:
+                        print(f"  {model_name} fitting failed: {str(e)}")
                     continue
             
             if best_model is None:
-                print("  All models failed, falling back to linear regression")
+                if self.verbose:
+                    print("  All models failed, falling back to linear regression")
                 coeffs = np.polyfit(t_train, p_train, 1)
                 best_predictions = np.polyval(coeffs, t_train)
                 best_model_name = "Linear fallback"
@@ -317,7 +323,8 @@ class StockPredictor:
                 forecast_times = np.linspace(training_end + 1, forecast_time, int(forecast_time - training_end))
                 raw_forecast_values = linear_fallback(forecast_times)
             else:
-                print(f"  Selected {best_model_name} model with MSE: {best_mse:.4f}")
+                if self.verbose:
+                    print(f"  Best model: {best_model_name} with MSE: {best_mse:.4f}")
                 
                 forecast_times = np.linspace(training_end + 1, forecast_time, int(forecast_time - training_end))
                 raw_forecast_values = best_model(forecast_times, *best_params)
@@ -341,15 +348,18 @@ class StockPredictor:
             cycle_position = market_info.get('cycle_position', 'unknown')
             
             if extreme_high or extreme_low or (cycle_position in ['near_peak', 'near_trough']):
-                print(f"  Applying market-aware mean reversion (strength={reversion_strength:.2f})")
+                if self.verbose:
+                    print(f"  Applying market-aware mean reversion (strength={reversion_strength:.2f})")
                 
                 if cycle_position == 'near_peak' and forecast_direction == 'upward':
-                    print("  Near market peak with upward forecast - increasing reversion")
+                    if self.verbose:
+                        print("  Near market peak with upward forecast - increasing reversion")
                     effective_reversion = min(reversion_strength * 1.5, 0.9)
                     reversion_target = max(price_mean, price_min + price_range * 0.4)
                     
                 elif cycle_position == 'near_trough' and forecast_direction == 'downward':
-                    print("  Near market trough with downward forecast - increasing reversion")
+                    if self.verbose:
+                        print("  Near market trough with downward forecast - increasing reversion")
                     effective_reversion = min(reversion_strength * 1.5, 0.9)
                     reversion_target = min(price_mean, price_max - price_range * 0.4)
                     
